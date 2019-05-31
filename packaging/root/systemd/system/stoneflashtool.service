@@ -1,0 +1,10 @@
+[Unit]
+Description=StoneFlashtool service file
+
+[Service]
+ExecStart=/usr/local/bin/stoneflashtool /etc/stoneflashtool/config.ini
+TimeoutStopSec=10
+ExecStop=/bin/kill -2 $MAINPID
+
+[Install]
+WantedBy=multi-user.target
