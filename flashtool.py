@@ -275,6 +275,9 @@ class EspDevice:
 
         self.mac = None
 
+        # detect plugged in device
+        self.do_detect()
+
     def stop(self):
         pass
 
@@ -584,9 +587,11 @@ class Main(FileSystemEventHandler):
                 if event.src_path in self.devices:
                     print('Detected new tty device {}, but it already exists in our database'.format(event.src_path))
                 else:
+                    print('Device plugged in: {}'.format(event.src_path))
                     self.devices[event.src_path] = EspDevice(event.src_path, self.nvs_config_data, self.mqtt, self.fw_loader)
             elif event.event_type == 'deleted':
                 if event.src_path in self.devices:
+                    print('Device removed: {}'.format(event.src_path))
                     self.devices[event.src_path].disconnected()
                     del self.devices[event.src_path]
 
