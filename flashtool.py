@@ -186,7 +186,7 @@ class NvsParser:
                 for key, val in data.items():
                     writer.writerow((key, *data))
 
-        p = subprocess.Popen([NvsParser.get_nvs_gen_path(), '--input', nvs_data_file, '--output', nvs_bin_file, '--size', nvs_size], stdout=subprocess.DEVNULL)
+        p = subprocess.Popen([NvsParser.get_nvs_gen_path(), '--input', nvs_data_file, '--output', nvs_bin_file, '--size', str(nvs_size)], stdout=subprocess.DEVNULL)
         p.wait()
         if p.returncode == 0:
             return nvs_bin_file
@@ -214,7 +214,7 @@ class EspOperations:
     @staticmethod
     def read_flash(serial_device, start_addr, size):
         tmp_file = '/tmp/flashtool_read'
-        p = subprocess.Popen([EspOperations.get_esptool_path(), '--port', serial_device, '--baud', '115200', 'read_flash', start_addr, size, tmp_file], stdout=subprocess.DEVNULL)
+        p = subprocess.Popen([EspOperations.get_esptool_path(), '--port', serial_device, '--baud', '115200', 'read_flash', str(start_addr), str(size), tmp_file], stdout=subprocess.DEVNULL)
         p.wait()
         if p.returncode == 0 and os.path.isfile(tmp_file):
             with open(tmp_file, 'rb') as rf:
@@ -225,7 +225,7 @@ class EspOperations:
 
     @staticmethod
     def write_flash(serial_device, start_addr, file_name):
-        p = subprocess.Popen([EspOperations.get_esptool_path(), '--port', serial_device, '--baud', '115200', 'write_flash', start_addr, file_name], stdout=subprocess.DEVNULL)
+        p = subprocess.Popen([EspOperations.get_esptool_path(), '--port', serial_device, '--baud', '115200', 'write_flash', str(start_addr), file_name], stdout=subprocess.DEVNULL)
         p.wait()
         return p.returncode == 0
 
@@ -246,7 +246,7 @@ class EspOperations:
     def read_nvs_data(serial_device):
         nvs_bin = EspOperations.read_flash(serial_device, '0x9000', '0x6000')
         if nvs_bin is None:
-            return None
+            return {}
 
         nvs_data = NvsParser.decode(nvs_bin)
         return nvs_data
@@ -355,7 +355,8 @@ class EspDevice:
             self.status = 'unsupported'
             return
 
-        self.mqtt.publish_detecting(self.mac)
+        # fielmon currently cannot display the detecting state
+        #self.mqtt.publish_detecting(self.mac)
 
 
         # TODO: read firmware name here
@@ -465,6 +466,7 @@ class MqttInterface:
         message = json.dumps({
             'event': 'connected',
             'stone': {
+                'mac': stone_mac,
                 'major': stone_major,
                 'minor': stone_minor,
                 'comment': stone_comment,
@@ -475,7 +477,7 @@ class MqttInterface:
                 'writing': stone_writing
             }
         })
-        self.client.publish(topic, payload=message, retain=(event == 'connected'))
+        self.client.publish(topic, payload=message, retain=True)
 
     def publish_disconnected(self, stone_mac):
         topic = 'flashtool/status/{}/{}'.format(self.own_mac, stone_mac)
