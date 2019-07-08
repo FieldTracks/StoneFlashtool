@@ -24,16 +24,21 @@ from watchdog.events import FileSystemEventHandler
 
 
 class FirmwareLoader:
-    def __init__(self, check_url):
+    def __init__(self, check_url, use_basic_auth, basic_auth_user, basic_auth_pass):
         self.check_url = check_url
+        self.use_basic_auth = use_basic_auth
+        self.basic_auth_user = basic_auth_user
+        self.basic_auth_pass = basic_auth_pass
 
         self.version = None
         self.firmware = None
         self.update_firmware()
 
-    @staticmethod
-    def download_file(url):
-        res = requests.get(url)
+    def download_file(self, url):
+        if self.use_basic_auth:
+            res = requests.get(url, auth=requests.auth.HTTPBasicAuth(self.basic_auth_user, self.basic_auth_pass))
+        else:
+            res = requests.get(url)
         if res.status_code == 200:
             return res.content
         else:
@@ -59,12 +64,12 @@ class FirmwareLoader:
         return self.firmware
 
     def get_info_json(self):
-        res = requests.get(self.check_url)
-        if res.status_code != 200:
+        info_json = self.download_file(self.check_url)
+        if info_json is None:
             return None
 
         try:
-            info = res.json()
+            info = json.loads(info_json)
         except json.JSONDecodeError:
             return None
 
@@ -91,12 +96,13 @@ class FirmwareLoader:
         fw = {}
         for fw_part in info['firmware']:
             if 'address' in fw_part and 'download' in fw_part:
-                fw_file = FirmwareLoader.download_file(fw_part['download'])
+                fw_file = self.download_file(fw_part['download'])
                 if fw_file is not None:
                     fw[fw_part['address']] = fw_file
 
         if len(fw) != len(info['firmware']):
             print('Failed to download firmware!')
+            return
 
         self.version = info['version']
         self.firmware = fw
@@ -135,25 +141,25 @@ class NvsParser:
         while cpos + 64 <= len(nvs_bin):
             if nvs_bin[cpos + 1] == 0xff:
                 cpos += 64
-                continue
             elif nvs_bin[cpos] == 0x0:
                 cpos += 32
-                continue
             elif struct.unpack('>H', nvs_bin[cpos+1:cpos+3])[0] == 0x2102:
                 key_start = cpos + 8
                 key = NvsParser.read_bytes_string(nvs_bin, key_start)
                 value_start = cpos + 32
                 value = NvsParser.read_bytes_string(nvs_bin, value_start)
-                nvs_data[key] = value
+                if key not in nvs_data:
+                    nvs_data[key] = value
                 cpos += 64
             elif struct.unpack('>H', nvs_bin[cpos+1:cpos+3])[0] == 0x0201:
                 key_start = cpos + 8
                 key = NvsParser.read_bytes_string(nvs_bin, key_start)
                 value = struct.unpack('<H', nvs_bin[key_start+16:key_start+18])[0]
-                nvs_data[key] = value
+                if key not in nvs_data:
+                    nvs_data[key] = value
                 cpos += 32
             else:
-                print('Can\'t parse NVS data, skipping block...')
+                # Can't parse NVS data, skipping block...
                 cpos += 32
 
         return nvs_data
@@ -178,13 +184,13 @@ class NvsParser:
 
         with open(nvs_data_file, 'w') as csv_file:
             fieldnames = ['key', 'type', 'encoding', 'value']
-            writer = csv.writer(csv_file, fieldnames=fieldnames)
-            writer.writeheader()
+            writer = csv.writer(csv_file)
+            writer.writerow(fieldnames)
             
             for ns, data in nvs_data.items():
                 writer.writerow((ns, 'namespace', '', ''))
                 for key, val in data.items():
-                    writer.writerow((key, *data))
+                    writer.writerow((key, *val))
 
         p = subprocess.Popen([NvsParser.get_nvs_gen_path(), '--input', nvs_data_file, '--output', nvs_bin_file, '--size', str(nvs_size)], stdout=subprocess.DEVNULL)
         p.wait()
@@ -230,21 +236,24 @@ class EspOperations:
         return p.returncode == 0
 
     @staticmethod
-    def read_version(serial_device):
-        v_buff = EspOperations.read_flash(serial_device, '0x10030', 32) 
-        if v_buff is not None:
-            version_str = NvsParser.read_bytes_string(v_buff, 0)
-            version_nums = version_str.split('.')
-            if len(version_nums) != 3 or not all(s.isdigit() for s in version_nums):
-                return None
-
-            return tuple(map(int, version))
-        else:
+    def read_firmware_info(serial_device):
+        v_buff = EspOperations.read_flash(serial_device, 0x10030, 64)
+        if v_buff is None or len(v_buff) != 64:
             return None
+
+        version_str = NvsParser.read_bytes_string(v_buff, 0)
+        version_nums = version_str.split('.')
+        if len(version_nums) != 3 or not all(s.isdigit() for s in version_nums):
+            version_nums = (0, 0, 0)
+        else:
+            version_nums = tuple(map(int, version_nums))
+
+        firmware_str = NvsParser.read_bytes_string(v_buff, 32)
+        return (firmware_str, version_nums)
 
     @staticmethod
     def read_nvs_data(serial_device):
-        nvs_bin = EspOperations.read_flash(serial_device, '0x9000', '0x6000')
+        nvs_bin = EspOperations.read_flash(serial_device, 0x9000, 0x6000)
         if nvs_bin is None:
             return {}
 
@@ -274,12 +283,17 @@ class EspDevice:
         self.active_thread = None
 
         self.mac = None
+        self.fw_name = ''
+        self.fw_version = (0, 0, 0)
+        self.beacon_major = 0
+        self.beacon_minor = 0
+        self.comment = ''
+        self.unknown_firmware = False
+        self.is_outdated = False
+        self.is_wrong_network = False
 
         # detect plugged in device
         self.do_detect()
-
-    def stop(self):
-        pass
 
     def is_idle(self):
         return self.status == 'idle' and (self.active_thread is None or not self.active_thread.is_alive())
@@ -346,6 +360,7 @@ class EspDevice:
     def disconnected(self):
         if self.mac is not None:
             self.mqtt.delete_retained(self.mac)
+            self.publish_status(is_connected=False)
 
 
     def async_detect_thread(self):
@@ -354,44 +369,60 @@ class EspDevice:
         if self.mac is None:
             self.status = 'unsupported'
             return
+        print('  {}'.format(self.mac))
 
         # fielmon currently cannot display the detecting state
         #self.mqtt.publish_detecting(self.mac)
 
-
-        # TODO: read firmware name here
-
-
-        # read firmware version
-        stone_version = EspOperations.read_version(self.device_path)
-        if stone_version is None:
-            stone_version = (0, 0, 0)
-        version_string = '{}.{}.{}'.format(*stone_version)
+        # read firmware name and version
+        firmware_info = EspOperations.read_firmware_info(self.device_path)
+        if firmware_info is None:
+            self.fw_name = ''
+            self.fw_version = (0, 0, 0)
+        else:
+            self.fw_name = firmware_info[0]
+            self.fw_version = firmware_info[1]
+        print('  {} {}'.format(self.fw_name, self.fw_version))
 
         # read NVS data
         stone_nvs_data = EspOperations.read_nvs_data(self.device_path)
+        print('  {}'.format(stone_nvs_data))
 
-        beacon_major = int(stone_nvs_data['beacon_major']) if 'beacon_major' in stone_nvs_data else 0
-        beacon_minor = int(stone_nvs_data['beacon_minor']) if 'beacon_minor' in stone_nvs_data else 0
-        comment = stone_nvs_data['comment'] if 'comment' in stone_nvs_data else ''
-
+        self.beacon_major = int(stone_nvs_data['beacon_major']) if 'beacon_major' in stone_nvs_data else 0
+        self.beacon_minor = int(stone_nvs_data['beacon_minor']) if 'beacon_minor' in stone_nvs_data else 0
+        self.comment = stone_nvs_data['comment'] if 'comment' in stone_nvs_data else ''
+ 
         # prepare flags for the mqtt message
-        is_outdated = FirmwareLoader.is_version_bigger(self.fw_loader.get_current_version(), stone_version)
-        
-        is_wrong_network = False
+        if self.fw_name == 'jellingstone':
+            self.unknown_firmware = False
+            self.is_outdated = FirmwareLoader.is_version_bigger(self.fw_loader.get_current_version(), self.fw_version)
+        else:
+            self.unknown_firmware = True
+            self.is_outdated = True
+
+        self.is_wrong_network = False
         for nvs_key, nvs_value in self.nvs_data.items():
+            if nvs_key == 'cert':
+                # Can't check that right now, because the parser can't read large strings
+                # and we would need to read the certificate file to compare this
+                continue
             if nvs_key not in stone_nvs_data or nvs_value != stone_nvs_data[nvs_key]:
-                is_wrong_network = True
+                self.is_wrong_network = True
                 break
 
-        self.mqtt.publish_connected(self.mac, beacon_major, beacon_minor, comment, version_string, is_outdated, is_wrong_network, False, False)
+        # advertise stone via mqtt
+        self.publish_status()
 
         # done
         self.status = 'idle'
 
 
     def async_flash_all_thread(self):
+        # publish status
+        self.publish_status(is_writing=True)
+
         # flash firmware
+        firmware_version = self.fw_loader.get_current_version()
         firmware = self.fw_loader.get_firmware()
         file_path = '/tmp/flashtool_write'
         for addr, fw_bin in firmware.items():
@@ -399,21 +430,58 @@ class EspDevice:
                 wf.write(fw_bin)
             EspOperations.write_flash(self.device_path, addr, file_path)
 
+        # update attributes
+        self.fw_name = 'jellingstone'
+        self.fw_version = firmware_version
+        self.unknown_firmware = False
+        self.is_outdated = False
+
+        # flash nvs
+        nvs_path = self.build_nvs()
+        if nvs_path is None:
+            print('Failed to build the NVS partition! Please check your config!')
+            self.publish_status()
+            self.status = 'idle'
+            return
+        EspOperations.write_flash(self.device_path, '0x9000', nvs_path)
+
+        # update attributes
+        self.beacon_major = self.nvs_data_stone['beacon_major']
+        self.beacon_minor = self.nvs_data_stone['beacon_minor']
+        self.comment = self.nvs_data_stone['comment']
+        self.is_wrong_network = False
+
+        # done
+        self.publish_status()
+        self.status = 'idle'
+
+    def async_flash_nvs_thread(self):
+        # publish status
+        self.publish_status(is_writing=True)
+
         # flash nvs
         nvs_path = self.build_nvs()
         EspOperations.write_flash(self.device_path, '0x9000', nvs_path)
 
-        # done
-        self.status = 'idle'
+        # update attributes
+        self.beacon_major = self.nvs_data_stone['beacon_major']
+        self.beacon_minor = self.nvs_data_stone['beacon_minor']
+        self.comment = self.nvs_data_stone['comment']
+        self.is_wrong_network = False
 
-    def async_flash_nvs_thread(self):
-        nvs_path = self.build_nvs()
-        EspOperations.write_flash(self.device_path, '0x9000', nvs_path)
+        # done
+        self.publish_status()
         self.status = 'idle'
 
     def async_check_boot_thread(self):
         print('Check boot not implemented!')
         self.status = 'idle'
+
+
+    def publish_status(self, is_connected=True, is_writing=False):
+        event = 'connected' if is_connected else 'disconnected'
+        version_string = '{}.{}.{}'.format(*self.fw_version)
+        self.mqtt.publish_status(event, self.mac, self.beacon_major, self.beacon_minor, self.comment, version_string, self.is_outdated, self.is_wrong_network, self.unknown_firmware, is_writing)
 
 
 class MqttInterface:
@@ -427,8 +495,10 @@ class MqttInterface:
             self.client.tls_set(cert, tls_version=ssl.PROTOCOL_TLSv1_2)
             if insecure:
                 self.client.tls_insecure_set(True)
+        self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
         self.client.connect(host, port)
+        time.sleep(1)
         self.delete_all_retained()
 
     def spin(self):
@@ -436,6 +506,9 @@ class MqttInterface:
 
     def stop(self):
         self.client.disconnect()
+
+    def on_connect(self, client, userdata, flags, rc):
+        self.client.subscribe('flashtool/command')
 
     def on_message(self, client, userdata, message):
         topic = message.topic
@@ -461,10 +534,10 @@ class MqttInterface:
         })
         self.client.publish(topic, payload=message)
 
-    def publish_connected(self, stone_mac, stone_major, stone_minor, stone_comment, stone_version, stone_outdated, stone_wrong_network, stone_unknown_software, stone_writing):
+    def publish_status(self, event, stone_mac, stone_major, stone_minor, stone_comment, stone_version, stone_outdated, stone_wrong_network, stone_unknown_software, stone_writing):
         topic = 'flashtool/status/{}/{}'.format(self.own_mac, stone_mac)
         message = json.dumps({
-            'event': 'connected',
+            'event': event,
             'stone': {
                 'mac': stone_mac,
                 'major': stone_major,
@@ -478,13 +551,6 @@ class MqttInterface:
             }
         })
         self.client.publish(topic, payload=message, retain=True)
-
-    def publish_disconnected(self, stone_mac):
-        topic = 'flashtool/status/{}/{}'.format(self.own_mac, stone_mac)
-        message = json.dumps({
-            'event': 'disconnected'
-        })
-        self.client.publish(topic, payload=message)
 
     def delete_retained(self, stone_mac):
         topic = 'flashtool/status/{}/{}'.format(self.own_mac, stone_mac)
@@ -500,7 +566,7 @@ class MqttInterface:
         device_topic = 'flashtool/status/{}/'.format(self.own_mac)
         print('Looking for old retained messages in {}'.format(device_topic))
         def del_retained(client, userdata, message):
-            if message.topic.startswith(device_topic):
+            if message.topic.startswith(device_topic) and message.payload != b'':
                 print('Deleting retained message from {}'.format(message.topic))
                 self.delete_retained(message.topic.split('/')[-1])
         self.client.on_message = del_retained
@@ -545,7 +611,14 @@ class Main(FileSystemEventHandler):
         }
 
         # Setup the firmware loader and download current firmware
-        self.fw_loader = FirmwareLoader(config.get('Firmware', 'FirmwareDownloadURL', fallback='http://localhost/update.json'))
+        fw_dl_url = config.get('Firmware', 'FirmwareDownloadURL', fallback='http://localhost/update.json')
+        fw_use_basic_auth = config.getboolean('Firmware', 'UseHttpBasicAuth', fallback=False)
+        fw_basic_auth_user = config.get('Firmware', 'BasicAuthUser', fallback='')
+        fw_basic_auth_pass = config.get('Firmware', 'BasicAuthPass', fallback='')
+        self.fw_loader = FirmwareLoader(fw_dl_url, fw_use_basic_auth, fw_basic_auth_user, fw_basic_auth_pass)
+        if self.fw_loader.get_current_version() is None:
+            print('Please check the FirmwareDownloadURL')
+            exit(1)
 
         # Connect to the MQTT broker
         mqtt_host = config.get('MQTT Auth', 'Hostname', fallback='localhost')
