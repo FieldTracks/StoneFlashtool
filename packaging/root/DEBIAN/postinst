@@ -3,4 +3,4 @@ set -e
 echo 'Installing python3 dependencies...'
 pip3 install -r /usr/share/stoneflashtool/requirements.txt
 echo 'Setting up service...'
-systemctl enable --now stoneflashtool.service
+systemctl enable --now stoneflashtool.service || true
